@@ -1,14 +1,29 @@
-import argparse, json, os, csv, math, subprocess, tempfile
+import argparse, json, os, math, subprocess, tempfile
 import numpy as np
-from moviepy.editor import (
+from moviepy import (
     ImageClip, AudioFileClip, CompositeAudioClip,
-    CompositeVideoClip, ColorClip, concatenate_videoclips
+    CompositeVideoClip, ColorClip, VideoClip, concatenate_videoclips
 )
 from PIL import Image, ImageDraw, ImageFont
+from edge_tts_helper import tts_edge
 
+# ---------- font helper (Windows/Linux) ----------
+def get_font(font_size: int):
+    candidates = [
+        os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "segoeui.ttf"),
+        os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "arial.ttf"),
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            try:
+                return ImageFont.truetype(p, font_size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
 
-# -------------------- УТИЛІТИ --------------------
-
+# ---------- helpers ----------
 def load_config(path):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -17,95 +32,82 @@ def hex_to_rgb(hx):
     hx = hx.lstrip("#")
     return (int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16))
 
-def read_sequence_to_groups(csv_path, group_pairs=5):
+def read_odd_even_groups(csv_path, pairs_per_group=5):
     """
     Одноколонковий CSV:
-      перший рядок — заголовок (може бути 'text' із BOM),
-      далі слова послідовно: 1,3,5,7,9 — ліворуч (ES), 2,4,6,8,10 — праворуч (UA).
-    Групуємо по 5 пар (10 рядків).
+      1-й рядок — заголовок (може бути 'text' із BOM),
+      далі слова блоками по 10 рядків:
+        непарні (позиції 1,3,5,7,9) -> зліва
+        парні  (позиції 2,4,6,8,10) -> справа
+    Повертає список груп: [(left5, right5), ...]
     """
     with open(csv_path, "r", encoding="utf-8", errors="replace") as f:
         raw = f.read()
-
-    # прибираємо BOM, якщо є
     if raw.startswith("\ufeff"):
         raw = raw.lstrip("\ufeff")
 
-    # розбиваємо на рядки, обрізаємо пробіли/коми й порожні
     lines = [ln.strip().strip(",") for ln in raw.splitlines()]
     lines = [ln for ln in lines if ln != ""]
     if not lines:
         raise ValueError("CSV порожній або не читається.")
 
-    # прибираємо заголовок, якщо схожий
     first = lines[0].lower()
-    if first in {"text", "word", "словo", "слово"} or "text" in first:
+    if first in {"text","word","словo","слово"} or "text" in first:
         lines = lines[1:]
 
     words = lines
-
-    # має бути парна кількість
-    if len(words) % 2 != 0:
-        words = words[:-1]  # відкидаємо «хвіст», щоб не падати
-
+    chunk = pairs_per_group * 2  # 10
     groups = []
-    chunk_size = group_pairs * 2  # 10 рядків = 5 пар
-    for start in range(0, len(words), chunk_size):
-        chunk = words[start:start + chunk_size]
-        if len(chunk) < chunk_size:
+    for start in range(0, len(words), chunk):
+        block = words[start:start+chunk]
+        if len(block) < chunk:
             break
-        left = chunk[0::2]   # непарні за змістом
-        right = chunk[1::2]  # парні за змістом
+        # odd/even розкладка:
+        left  = block[0::2]  # 0,2,4,6,8  -> 1,3,5,7,9
+        right = block[1::2]  # 1,3,5,7,9  -> 2,4,6,8,10
         groups.append((left, right))
-
     if not groups:
-        raise ValueError("Не знайшов жодної повної групи по 5 парах у CSV (перевір порядок і кількість рядків).")
-
+        raise ValueError("Не знайшов жодної повної групи по 10 рядків у CSV.")
     return groups
 
 def rgba_image_to_clip(img_rgba, position, duration):
-    """PIL RGBA -> (RGB clip + альфа-маска), щоб уникнути помилок 3 vs 4 канали."""
     arr = np.array(img_rgba)
     if arr.ndim == 3 and arr.shape[2] == 4:
         rgb = arr[:, :, :3]
         alpha = (arr[:, :, 3].astype(float) / 255.0)
-        base = ImageClip(rgb).set_position(position).set_duration(duration)
-        mask = ImageClip(alpha, ismask=True).set_position(position).set_duration(duration)
-        return base.set_mask(mask)
+        base = ImageClip(rgb).with_duration(duration)
+        mask = VideoClip(lambda t: alpha).with_duration(duration)
+        return base.with_mask(mask).with_position(position)
     else:
-        return ImageClip(arr).set_position(position).set_duration(duration)
+        return ImageClip(arr).with_position(position).with_duration(duration)
 
 def make_column_image_fixed_rows(lines, n_rows, font_size, width_px, color_hex, line_spacing=1.25, pad_y=10):
-    """Малює рівно n_rows рядків (порожні теж), щоб вирівнювання рядок-до-рядка було ідеальним."""
-    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-    font = ImageFont.truetype(font_path, font_size)
-
+    """Рівно n_rows рядків (порожні теж) — ідеальне вирівнювання рядок-до-рядка."""
+    font = get_font(font_size)
     ascent, descent = font.getmetrics()
     line_h = ascent + descent
     row_h = int(line_h * line_spacing)
     total_h = n_rows * row_h + 2 * pad_y
 
-    img = Image.new("RGBA", (width_px, total_h), (0, 0, 0, 0))
+    img = Image.new("RGBA", (width_px, total_h), (0,0,0,0))
     draw = ImageDraw.Draw(img)
-    r, g, b = hex_to_rgb(color_hex)
-    fill = (r, g, b, 255)
+    r,g,b = hex_to_rgb(color_hex); fill = (r,g,b,255)
 
     for i in range(n_rows):
         txt = lines[i] if i < len(lines) else ""
-        w_px, h_px = draw.textsize(txt, font=font)
-        x = (width_px - w_px) // 2
-        y = pad_y + i * row_h + (row_h - h_px) // 2
-        draw.text((x, y), txt, font=font, fill=fill)
-
+        bbox = draw.textbbox((0, 0), txt, font=font)
+        w_px, h_px = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        x = (width_px - w_px)//2
+        y = pad_y + i*row_h + (row_h - h_px)//2
+        draw.text((x,y), txt, font=font, fill=fill)
     return img
 
 def ring_image(w, h, frac, center, radius, thickness, color_rgb, bg_opacity=0.3):
-    img = Image.new("RGBA", (w, h), (0,0,0,0))
+    img = Image.new("RGBA", (w,h), (0,0,0,0))
     draw = ImageDraw.Draw(img)
     cx, cy = center
     bbox = [cx-radius, cy-radius, cx+radius, cy+radius]
-    bg_a = int(255*bg_opacity)
-    draw.ellipse(bbox, outline=(255,255,255,bg_a), width=thickness)
+    draw.ellipse(bbox, outline=(255,255,255,int(255*bg_opacity)), width=thickness)
     if frac > 0:
         end = 360*frac
         r,g,b = color_rgb
@@ -113,161 +115,131 @@ def ring_image(w, h, frac, center, radius, thickness, color_rgb, bg_opacity=0.3)
     return img
 
 def digit_image(w, h, text, center_y, font_size, color_hex):
-    img = Image.new("RGBA", (w, h), (0,0,0,0))
+    img = Image.new("RGBA", (w,h), (0,0,0,0))
     draw = ImageDraw.Draw(img)
-    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-    font = ImageFont.truetype(font_path, font_size)
-    r,g,b = hex_to_rgb(color_hex)
-    fill = (r,g,b,255)
-    w_px, h_px = draw.textsize(text, font=font)
+    font = get_font(font_size)
+    r,g,b = hex_to_rgb(color_hex); fill = (r,g,b,255)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    w_px, h_px = bbox[2] - bbox[0], bbox[3] - bbox[1]
     x = (w - w_px)//2
     y = int(center_y - h_px*0.5)
     draw.text((x,y), text, font=font, fill=fill)
     return img
 
 def make_timer_clip(W,H,dur,center,radius,thickness,accent_rgb,bg_opacity, number_center_y, font_size, text_color):
-    r0 = ring_image(W,H,0.0,center,radius,thickness,accent_rgb,bg_opacity)
-    n0 = digit_image(W,H,f"{int(math.ceil(dur))}",number_center_y,font_size,text_color)
+    # ТІЛЬКИ КІЛЬЦЕ, БЕЗ ЦИФР
 
     def ring_frame(t):
         frac = min(1.0, max(0.0, t/dur))
-        return np.array(ring_image(W,H,frac,center,radius,thickness,accent_rgb,bg_opacity))[:, :, :3]
+        img = ring_image(W,H,frac,center,radius,thickness,accent_rgb,bg_opacity)
+        return np.array(img)[:, :, :3]  # RGB
+
     def ring_mask(t):
         frac = min(1.0, max(0.0, t/dur))
-        return np.array(ring_image(W,H,frac,center,radius,thickness,accent_rgb,bg_opacity))[:, :, 3].astype(float)/255.0
-    def num_frame(t):
-        n = max(0, int(math.ceil(dur - t)))
-        return np.array(digit_image(W,H,f"{n}",number_center_y,font_size,text_color))[:, :, :3]
-    def num_mask(t):
-        n = max(0, int(math.ceil(dur - t)))
-        img = digit_image(W,H,f"{n}",number_center_y,font_size,text_color)
-        return np.array(img)[:, :, 3].astype(float)/255.0
+        img = ring_image(W,H,frac,center,radius,thickness,accent_rgb,bg_opacity)
+        return np.array(img)[:, :, 3].astype(float)/255.0  # 0..1
 
-    ring_clip = ImageClip(np.array(r0)[:, :, :3]).set_make_frame(ring_frame).set_duration(dur)
-    ring_clip = ring_clip.set_mask(
-        ImageClip((np.array(r0)[:, :, 3].astype(float)/255.0), ismask=True).set_make_frame(ring_mask).set_duration(dur)
-    )
+    ring_clip = VideoClip(ring_frame).with_duration(dur)
+    ring_mask_clip = VideoClip(ring_mask).with_duration(dur)
+    ring_clip = ring_clip.with_mask(ring_mask_clip)
+    return ring_clip
 
-    num_clip = ImageClip(np.array(n0)[:, :, :3]).set_make_frame(num_frame).set_duration(dur)
-    num_clip = num_clip.set_mask(
-        ImageClip((np.array(n0)[:, :, 3].astype(float)/255.0), ismask=True).set_make_frame(num_mask).set_duration(dur)
-    )
+def tts_edge_uk(text, out_path):
+    # Генерує MP3 українським голосом
+    tts_edge(text, "uk", out_path)
 
-    return ring_clip, num_clip
+def tts_edge_multi(text, lang_code, out_path):
+    # Універсальна озвучка: lang_code = 'uk' | 'es' | 'ru' | 'de' | 'fr' | 'pt' | 'tr'
+    tts_edge(text, lang_code, out_path)
 
-def tts_espeak_uk(text, wav_path, rate=150):
-    subprocess.run(["espeak-ng", "-v", "uk", "-s", str(rate), "-w", wav_path, text], check=True)
-
-
-# -------------------- ОСНОВНА --------------------
-
+# ---------- main ----------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", default="inputs/seq1.csv")   # один стовпець: непарні=ES, парні=UA
+    ap.add_argument("--csv", default="inputs/seq1.csv")   # 1 колонка: odd->left, even->right (10 рядків на групу)
     ap.add_argument("--config", default="config.json")
     ap.add_argument("--out", default="outputs/lesson1.mp4")
-    ap.add_argument("--stage_seconds", type=float, default=5.0,
-                    help="кожен крок відкриття перекладу (сек.)")
-    ap.add_argument("--last_hold_seconds", type=float, default=1.5,
-                    help="показати ВСІ 10 слів після 5-ї пари (сек.)")
-    ap.add_argument("--intro_delay", type=float, default=1.0,
-                    help="затримка на старті (тільки фон+аватар), сек")
+    ap.add_argument("--stage_seconds", type=float, default=3.5, help="крок відкриття перекладу (сек.)")
+    ap.add_argument("--hold_seconds",  type=float, default=1.5, help="утримання всіх 10 слів після 5-ї пари (мінімум, сек.)")
+    ap.add_argument("--end_hold_seconds", type=float, default=1.0, help="утримання після останньої групи (мінімум, сек.)")
+    ap.add_argument("--intro_delay",   type=float, default=1.5, help="затримка на старті (фон+аватар), сек")
+    ap.add_argument("--tts_lang_right", default="uk", help="Код мови для озвучки правої колонки (uk, es, ru, de, fr, pt, tr)")
     args = ap.parse_args()
 
     C = load_config(args.config)
-    W,H = C["width"], C["height"]
-    FPS = C["fps"]
+    W,H = C["width"], C["height"]; FPS = C["fps"]
 
-    print(">>> MODE: odd->left (ES), even->right (UA), groups of 5 pairs; 1s intro; 1.5s hold after 5th pair.")
+    print(">>> MODE: odd/even groups of 10 (1,3,5,7,9 left; 2,4,6,8,10 right), intro 1.5s, 5s steps, proper last TTS hold")
 
-    # фон
-    bg = ColorClip(size=(W,H), color=hex_to_rgb(C["bg_color"])).set_duration(0.1)
-
-    # аватар
+    # фон і аватар
+    bg = ColorClip(size=(W,H), color=hex_to_rgb(C["bg_color"])).with_duration(0.1)
     avatar_img = Image.open(C["avatar"]).convert("RGBA")
-    aw = int(W*C["avatar_scale"])
-    ah = int(avatar_img.height * (aw/avatar_img.width))
+    aw = int(W*C["avatar_scale"]); ah = int(avatar_img.height * (aw/avatar_img.width))
     avatar_img = avatar_img.resize((aw,ah), resample=Image.LANCZOS)
     avatar_pos = ("center", int(H*C["avatar_y"] - ah/2))
 
-    # геометрія колонок
+    # геометрія
     cols_top_y = int(H*C["cols_top_y"])
-    col_w = int(W*C["col_width"])
-    margin = int(W*C["col_margin"])
-    left_x = margin
-    right_x = W - margin - col_w
+    col_w = int(W*C["col_width"]); margin = int(W*C["col_margin"])
+    left_x = margin; right_x = W - margin - col_w
 
-    font_size = int(C.get("font_size",56))
-    text_color = C.get("text_color","#ffffff")
+    font_size = int(C.get("font_size",56)); text_color = C.get("text_color","#ffffff")
 
     # таймер
     accent_rgb = hex_to_rgb(C["accent_color"])
     timer_center = (W//2, int(H*C["timer_top_y"]))
-    timer_radius = C["timer_radius"]
-    timer_thickness = C["timer_thickness"]
+    timer_radius = C["timer_radius"]; timer_thickness = C["timer_thickness"]
     timer_bg_opacity = C["timer_bg_opacity"]
     number_center_y = int(H*C["timer_top_y"] - C["timer_radius"]*0.15)
     num_font_size = C["timer_font_size"]
 
     # дані
-    groups = read_sequence_to_groups(args.csv, group_pairs=5)
+    groups = read_odd_even_groups(args.csv, pairs_per_group=5)
     print(f">>> Loaded groups: {len(groups)}")
 
     stage = args.stage_seconds
-    hold_dur = max(0.001, args.last_hold_seconds)
+    base_hold = max(0.001, args.hold_seconds)
+    end_hold  = max(0.001, args.end_hold_seconds)
 
-    clips = []
-    audio_segments = []
+    clips = []; audio_segments = []
     t_cursor = 0.0  # відео-таймлайн
-    t_audio  = 0.0  # аудіо-таймлайн
+    tmpdir = tempfile.mkdtemp(prefix="tts_batch_")
 
-    # --- 1-секундна заставка перед першою п’ятіркою (тільки фон + аватар) ---
+    # інтро 1.5 с (тільки фон + аватар)
     intro = max(0.0, args.intro_delay)
     if intro > 0:
         avatar_intro = rgba_image_to_clip(avatar_img, avatar_pos, intro)
-        comp_intro = CompositeVideoClip([bg.set_duration(intro), avatar_intro]).set_duration(intro)
+        comp_intro = CompositeVideoClip([bg.with_duration(intro), avatar_intro]).with_duration(intro)
         clips.append(comp_intro)
         t_cursor += intro
-        t_audio  += intro
 
-    tmpdir = tempfile.mkdtemp(prefix="tts_batch_")
-    group_idx = 0
-
-    for (left_words, right_words) in groups:
-        current_group = group_idx
-        group_idx += 1
-
+    total_groups = len(groups)
+    for gi, (left_words, right_words) in enumerate(groups):
         n = len(left_words)  # 5
-
-        # Лівий блок (непарні) на всю групу
+        # Ліві слова (1,3,5,7,9) малюємо на всю групу
         left_block_img = make_column_image_fixed_rows(left_words, n, font_size, col_w, text_color)
 
-        # КРОК 0: показати ліві 5; справа порожньо; таймер stage
+        # КРОК 0: 5с таймера + ліві 5, справа — порожньо
         right_empty_img = make_column_image_fixed_rows([], n, font_size, col_w, text_color)
-
         left_block_clip0  = rgba_image_to_clip(left_block_img,  (left_x, cols_top_y), stage)
         right_block_clip0 = rgba_image_to_clip(right_empty_img, (right_x, cols_top_y), stage)
         avatar_clip0      = rgba_image_to_clip(avatar_img,      avatar_pos,          stage)
-        ring0, num0       = make_timer_clip(
-            W,H,stage, timer_center, timer_radius, timer_thickness,
-            accent_rgb, timer_bg_opacity, number_center_y, num_font_size, text_color
-        )
-
+        ring0 = make_timer_clip(W,H,stage, timer_center,timer_radius,timer_thickness,
+                                accent_rgb,timer_bg_opacity, number_center_y,num_font_size,text_color)
         comp0 = CompositeVideoClip([
-            bg.set_duration(stage),
-            avatar_clip0, left_block_clip0, right_block_clip0,
-            ring0, num0
-        ]).set_duration(stage)
+            bg.with_duration(stage),
+            avatar_clip0,
+            left_block_clip0,
+            right_block_clip0,
+            ring0
+        ]).with_duration(stage)
         clips.append(comp0)
-
         t_cursor += stage
-        t_audio  += stage  # перший TTS піде зі кроку 1
 
-        # КРОКИ 1..5: додаємо переклади справа (і вони ЗАЛИШАЮТЬСЯ)
+        # КРОКИ 1..5: кожні 5с додаємо переклад справа; озвучка стартує в момент появи
+        last_vo_dur = 0.0
         for i in range(n):
-            is_last = (i == n - 1)
-            # 1..4 — повні 5 с із таймером; 5-е — миттєво (0.001 с), без таймера
-            dur_video = stage if not is_last else 0.001
+            is_last = (i == n-1)
+            dur_video = stage if not is_last else 0.001  # 5-е — миттєво; HOLD покажемо окремо
 
             accumulated = right_words[:i+1]
             right_block_img = make_column_image_fixed_rows(accumulated, n, font_size, col_w, text_color)
@@ -275,54 +247,49 @@ def main():
             left_block_clip  = rgba_image_to_clip(left_block_img,  (left_x, cols_top_y), dur_video)
             avatar_clipi     = rgba_image_to_clip(avatar_img,      avatar_pos,          dur_video)
 
-            layers = [bg.set_duration(dur_video), avatar_clipi, left_block_clip, right_block_clip]
+            layers = [bg.with_duration(dur_video), avatar_clipi, left_block_clip, right_block_clip]
             if not is_last:
-                ringi, numi = make_timer_clip(
-                    W, H, dur_video, timer_center, timer_radius, timer_thickness,
-                    accent_rgb, timer_bg_opacity, number_center_y, num_font_size, text_color
-                )
-                layers += [ringi, numi]
-
-            compi = CompositeVideoClip(layers).set_duration(dur_video)
+                ringi = make_timer_clip(W,H,dur_video, timer_center,timer_radius,timer_thickness,
+                                        accent_rgb,timer_bg_opacity, number_center_y,num_font_size,text_color)
+                layers += [ringi]
+            compi = CompositeVideoClip(layers).with_duration(dur_video)
             clips.append(compi)
 
-            # Озвучка перекладу (праве слово) — унікальне ім'я, щоб не збивалося між групами
-            wav_path = os.path.join(tmpdir, f"uk_g{current_group}_i{i}.wav")
+            # TTS: для 1..4 стартує на t_cursor (момент появи); для 5-го — в HOLD, одразу після цього 0.001с кадру
+            wav_path = os.path.join(tmpdir, f"uk_g{gi}_i{i}.mp3")
             try:
-                tts_espeak_uk(right_words[i], wav_path, rate=150)
-                seg = AudioFileClip(wav_path).set_start(t_audio)
+                tts_edge_multi(right_words[i], args.tts_lang_right, wav_path)
+                if is_last:
+                    seg = AudioFileClip(wav_path).with_start(t_cursor + dur_video)  # HOLD починається після цього кадру
+                    last_vo_dur = seg.duration or 0.0
+                else:
+                    seg = AudioFileClip(wav_path).with_start(t_cursor)
                 audio_segments.append(seg)
-            except Exception:
-                pass
+            except Exception as e:
+                print("TTS error:", e)
 
-            # час
             t_cursor += dur_video
-            t_audio  += stage  # аудіо завжди рівними кроками 5с
 
-        # ПІСЛЯ 5-Ї ПАРИ: показати ВСІ 10 слів ще hold_dur (без таймера), потім одразу нова п’ятірка
+        # HOLD: показати всі 10 слів
+        base = base_hold if gi < total_groups-1 else end_hold
+        group_hold = max(base, last_vo_dur)  # тримаємо мінімум base, але не менше за тривалість озвучки 5-го
         right_full_img  = make_column_image_fixed_rows(right_words, n, font_size, col_w, text_color)
-        right_full_clip = rgba_image_to_clip(right_full_img, (right_x, cols_top_y), hold_dur)
-        left_full_clip  = rgba_image_to_clip(left_block_img, (left_x, cols_top_y), hold_dur)
-        avatar_hold     = rgba_image_to_clip(avatar_img,     avatar_pos,           hold_dur)
-
-        comp_hold = CompositeVideoClip(
-            [bg.set_duration(hold_dur), avatar_hold, left_full_clip, right_full_clip]
-        ).set_duration(hold_dur)
+        right_full_clip = rgba_image_to_clip(right_full_img, (right_x, cols_top_y), group_hold)
+        left_full_clip  = rgba_image_to_clip(left_block_img, (left_x, cols_top_y), group_hold)
+        avatar_hold     = rgba_image_to_clip(avatar_img,     avatar_pos,           group_hold)
+        comp_hold = CompositeVideoClip([bg.with_duration(group_hold), avatar_hold, left_full_clip, right_full_clip]).with_duration(group_hold)
         clips.append(comp_hold)
+        t_cursor += group_hold
 
-        t_cursor += hold_dur
-        t_audio  += hold_dur  # 5-те слово може ще звучати в межах цієї «утримуючої» паузи
-
-    # Фінал: відео + звук
+    # фінал: відео + звук
     video = concatenate_videoclips(clips, method="compose")
     if audio_segments:
-        final_audio = CompositeAudioClip(audio_segments).set_duration(video.duration)
-        video = video.set_audio(final_audio)
+        final_audio = CompositeAudioClip(audio_segments).with_duration(video.duration)
+        video = video.with_audio(final_audio)
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     video.write_videofile(args.out, fps=FPS, codec="libx264", audio_codec="aac", preset="medium", threads=4)
 
-
 if __name__ == "__main__":
-    print(">>> MODE ACTIVE: odd->left, even->right, 1s intro, 5s stages, 1.5s hold of all 10, unique TTS per step.")
+    print(">>> MODE ACTIVE: odd/even by 10, intro 1.5s, 5s stages, last TTS during full-10 hold")
     main()
